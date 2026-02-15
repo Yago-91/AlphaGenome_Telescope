@@ -4,6 +4,8 @@ import sys
 from utils import helpers
 from core import scanner, inspector
 
+# AlphaGenome Telescope: Enhancer Discovery & Characterization Tool
+
 def main():
     parser = argparse.ArgumentParser(description="AlphaGenome Telescope: Enhancer Discovery & Characterization Tool")
     
