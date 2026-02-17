@@ -21,7 +21,7 @@ def main():
     target.add_argument("--gene", type=str)
     target.add_argument("--region", type=str)
     target.add_argument("--window_size", type=int, default=196608)
-    target.add_argument("--exclude_gene_body", action="store_true", default=True)
+    target.add_argument("--exclude_gene_body", action="store_true", default=False, help="Skip mutations inside the gene body.")
 
     scan_params = parser.add_argument_group("Scan")
     scan_params.add_argument("--mutation_size", type=int, default=2000)
