@@ -13,36 +13,26 @@ def resolve_coordinates(args):
     """
     Dynamically fetches coordinates for ANY gene symbol using MyGene.info (hg38).
     """
-    # Case A: Manual Region (e.g., "chr6:100-200")
     if args.region:
         try:
             chrom, span = args.region.split(':')
             start, end = map(int, span.split('-'))
             return {
-                'chrom': chrom,
-                'start': start,
-                'end': end,
-                'strand': '+', # Default to + for regions
-                'tss': start   # Default TSS to start
+                'chrom': chrom, 'start': start, 'end': end, 'strand': '+', 'tss': start
             }
         except ValueError:
             raise ValueError("Invalid Region Format. Use 'chr:start-end'")
 
-    # Case B: Gene Symbol (e.g., "TFEB", "MYC")
     elif args.gene:
         print(f"   [i] Querying MyGene.info for '{args.gene}' coordinates (hg38)...")
         mg = mygene.MyGeneInfo()
-        
-        # Query for genomic position
         results = mg.query(args.gene, scopes='symbol', fields='genomic_pos', species='human')
         
         if not results or 'hits' not in results or len(results['hits']) == 0:
             raise ValueError(f"Gene '{args.gene}' not found in database.")
             
-        # Get the first hit (usually the best match)
         hit = results['hits'][0]
         if 'genomic_pos' not in hit:
-             # sometimes genomic_pos is a list if multiple locations exists, take the first
              if isinstance(hit.get('genomic_pos'), list):
                  gpos = hit['genomic_pos'][0]
              else:
@@ -51,16 +41,12 @@ def resolve_coordinates(args):
             gpos = hit['genomic_pos']
             if isinstance(gpos, list): gpos = gpos[0]
 
-        # Extract Info
         chrom = f"chr{gpos['chr']}"
         start_bp = gpos['start']
         end_bp = gpos['end']
-        strand_val = gpos['strand'] # 1 or -1
+        strand_val = gpos['strand']
         
-        # LOGIC: Calculate TSS based on Strand
-        # Ensembl/MyGene 'start' is always the smallest coordinate.
-        # If Strand is + (1), TSS is 'start'.
-        # If Strand is - (-1), TSS is 'end'.
+        # TSS Logic
         if strand_val == 1:
             tss = start_bp
             strand_sym = '+'
@@ -70,36 +56,32 @@ def resolve_coordinates(args):
             
         print(f"       -> Found {args.gene} on {chrom} ({strand_sym} strand). TSS: {tss}")
 
-        # Calculate the 1Mb Input Window (Centered on TSS)
+        # 1Mb Input Window (Centered on TSS)
         half_window = args.window_size // 2
         window_start = tss - half_window
         window_end = tss + half_window
         
-        # Define Gene Body (for Exclusion)
-        # We add a buffer to be safe
+        # Buffer for gene body exclusion
         gene_buffer = 1000
-        gene_start_rel = (start_bp - window_start) - gene_buffer
-        gene_end_rel = (end_bp - window_start) + gene_buffer
+        if strand_sym == '+':
+             gene_start_rel = (start_bp - window_start) - gene_buffer
+             gene_end_rel = (end_bp - window_start) + gene_buffer
+        else:
+             # If negative strand, gene starts at 'end_bp' (TSS) and goes down to 'start_bp'
+             # But in linear coordinates, the body is still start_bp to end_bp.
+             gene_start_rel = (start_bp - window_start) - gene_buffer
+             gene_end_rel = (end_bp - window_start) + gene_buffer
 
         return {
-            'chrom': chrom,
-            'start': window_start,
-            'end': window_end,
-            'strand': strand_sym,
-            'tss': tss,
-            'gene_start_rel': gene_start_rel,
-            'gene_end_rel': gene_end_rel
+            'chrom': chrom, 'start': window_start, 'end': window_end, 'strand': strand_sym,
+            'tss': tss, 'gene_start_rel': gene_start_rel, 'gene_end_rel': gene_end_rel
         }
-
     else:
         raise ValueError("No Target Specified. Use --gene SYMBOL or --region.")
 
 def fetch_sequence(model, coords):
     keys = list(model._fasta_extractors.keys())
-    hum_key = next((k for k in keys if "9606" in str(k) or "SAPIENS" in str(k).upper()), None)
-    if not hum_key:
-        hum_key = keys[0]
-
+    hum_key = next((k for k in keys if "9606" in str(k) or "SAPIENS" in str(k).upper()), keys[0])
     from alphagenome.data import genome
     interval = genome.Interval(coords['chrom'], coords['start'], coords['end'])
     seq = model._fasta_extractors[hum_key].extract(interval)
@@ -109,8 +91,7 @@ def one_hot_encode(seq):
     mapping = {'A': 0, 'C': 1, 'G': 2, 'T': 3}
     arr = np.zeros((len(seq), 4), dtype=np.float32)
     for i, char in enumerate(seq.upper()):
-        if char in mapping:
-            arr[i, mapping[char]] = 1.0
+        if char in mapping: arr[i, mapping[char]] = 1.0
     return jnp.array(arr)
 
 def mask_sequence(args):
@@ -124,21 +105,31 @@ def mask_sequence(args):
 
 def find_track_indices(model, tissue, assay):
     all_tracks = get_track_metadata(model)
-    indices = []
-    for i, name in enumerate(all_tracks):
-        if tissue.lower() in name.lower() and assay.lower() in name.lower():
-            indices.append(i)
     
+    # SMART ALIASING (The Fix)
+    search_assay = assay.lower()
+    if search_assay == 'rna': 
+        search_assay = 'cage'  # Remap RNA -> CAGE
+    
+    indices = []
+    found_names = []
+    
+    for i, name in enumerate(all_tracks):
+        # Check if BOTH tissue and assay are in the string
+        if tissue.lower() in name.lower() and search_assay in name.lower():
+            indices.append(i)
+            found_names.append(name)
+            
     if not indices:
-        print(f"WARNING: No tracks found for '{tissue}' + '{assay}'. (Searched {len(all_tracks)} tracks).")
-        print(f"Sample tracks: {all_tracks[:3]}")
-        # Return first 5 as emergency fallback to prevent crash, but user should know.
+        print(f"WARNING: No tracks found for '{tissue}' + '{assay}' (mapped to '{search_assay}').")
+        print(f"Sample tracks from list: {all_tracks[10:13]}") 
         return list(range(5))
+    
+    print(f"   [+] Found {len(indices)} tracks matching '{tissue}' + '{assay}' (e.g., '{found_names[0]}')")
     return indices
 
 def get_head_key(preds, assay_name):
     keys = list(preds.keys())
-    # Prefer 'human' key
     target = next((k for k in keys if 'human' in str(k).lower()), keys[0])
     return target
 
@@ -169,32 +160,34 @@ def predict_all_tracks(model, params, state, seq):
     head_key = get_head_key(raw_out, 'human')
     return np.array(raw_out[head_key][0])
 
-# --- 3. METADATA HANDLING (The Fix) ---
+# --- 3. METADATA HANDLING ---
 
 def download_official_tracks():
-    """Downloads the Enformer track list from a reliable source."""
+    """Downloads and parses the Enformer track list correctly."""
     url = "https://raw.githubusercontent.com/calico/basenji/master/manuscripts/cross2020/targets_human.txt"
     dest = "human_track_names.txt"
     
     if not os.path.exists(dest):
-        print("   [i] Downloading official track metadata...")
         try:
             r = requests.get(url)
-            with open(dest, 'w') as f:
-                f.write(r.text)
+            with open(dest, 'w') as f: f.write(r.text)
         except Exception as e:
             print(f"   [!] Download failed: {e}")
             return []
             
-    # Read file (Format: index \t identifier \t description)
     tracks = []
     with open(dest, 'r') as f:
-        for line in f:
+        lines = f.readlines()
+        # Skip header (index genome identifier...)
+        for line in lines[1:]: 
             parts = line.strip().split('\t')
-            if len(parts) > 1:
-                # Combine identifier and description for better matching
-                # e.g., "CNhs12345 Spleen RNA-seq"
-                tracks.append(" ".join(parts))
+            # The description is usually the last column (index 7 or -1)
+            if len(parts) >= 2:
+                # We store the full description line so search works on "CAGE:spleen"
+                # usually parts[-1] is "CAGE:spleen, adult, human"
+                tracks.append(parts[-1]) 
+            else:
+                tracks.append(line.strip())
     return tracks
 
 def get_track_metadata(model):
@@ -202,13 +195,11 @@ def get_track_metadata(model):
     if hasattr(model, 'track_names'): return model.track_names
     if hasattr(model, 'config') and hasattr(model.config, 'target_names'): return model.config.target_names
     
-    # 2. Try fetching from file (The robust fix)
+    # 2. Try fetching from file
     tracks = download_official_tracks()
-    if tracks:
-        return tracks
+    if tracks: return tracks
 
     print("WARNING: Could not find ANY track names. Using IDs.")
-    # Assuming Enformer standard 5313
     return [f"Track_{i}" for i in range(5313)]
 
 def clean_track_name(raw_name):
