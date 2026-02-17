@@ -5,24 +5,16 @@ import numpy as np
 import pandas as pd
 import jax
 import jax.numpy as jnp
+import mygene
 
 # --- 1. COORDINATE & SEQUENCE HANDLING ---
 
 def resolve_coordinates(args):
-    # Hardcoded TFEB TSS for this version
-    if args.gene and args.gene.upper() == "TFEB":
-        tss = 41704353
-        half_window = args.window_size // 2
-        return {
-            'chrom': 'chr6',
-            'start': tss - half_window,
-            'end': tss + half_window,
-            'strand': '-',
-            'tss': tss,
-            'gene_start_rel': tss - 5000,
-            'gene_end_rel': tss + 45000
-        }
-    elif args.region:
+    """
+    Dynamically fetches coordinates for ANY gene symbol using MyGene.info (hg38).
+    """
+    # Case A: Manual Region (e.g., "chr6:100-200")
+    if args.region:
         try:
             chrom, span = args.region.split(':')
             start, end = map(int, span.split('-'))
@@ -30,13 +22,77 @@ def resolve_coordinates(args):
                 'chrom': chrom,
                 'start': start,
                 'end': end,
-                'strand': '+',
-                'tss': start
+                'strand': '+', # Default to + for regions
+                'tss': start   # Default TSS to start
             }
         except ValueError:
             raise ValueError("Invalid Region Format. Use 'chr:start-end'")
+
+    # Case B: Gene Symbol (e.g., "TFEB", "MYC")
+    elif args.gene:
+        print(f"   [i] Querying MyGene.info for '{args.gene}' coordinates (hg38)...")
+        mg = mygene.MyGeneInfo()
+        
+        # Query for genomic position
+        results = mg.query(args.gene, scopes='symbol', fields='genomic_pos', species='human')
+        
+        if not results or 'hits' not in results or len(results['hits']) == 0:
+            raise ValueError(f"Gene '{args.gene}' not found in database.")
+            
+        # Get the first hit (usually the best match)
+        hit = results['hits'][0]
+        if 'genomic_pos' not in hit:
+             # sometimes genomic_pos is a list if multiple locations exists, take the first
+             if isinstance(hit.get('genomic_pos'), list):
+                 gpos = hit['genomic_pos'][0]
+             else:
+                 raise ValueError(f"No genomic coordinates found for {args.gene}.")
+        else:
+            gpos = hit['genomic_pos']
+            if isinstance(gpos, list): gpos = gpos[0]
+
+        # Extract Info
+        chrom = f"chr{gpos['chr']}"
+        start_bp = gpos['start']
+        end_bp = gpos['end']
+        strand_val = gpos['strand'] # 1 or -1
+        
+        # LOGIC: Calculate TSS based on Strand
+        # Ensembl/MyGene 'start' is always the smallest coordinate.
+        # If Strand is + (1), TSS is 'start'.
+        # If Strand is - (-1), TSS is 'end'.
+        if strand_val == 1:
+            tss = start_bp
+            strand_sym = '+'
+        else:
+            tss = end_bp
+            strand_sym = '-'
+            
+        print(f"       -> Found {args.gene} on {chrom} ({strand_sym} strand). TSS: {tss}")
+
+        # Calculate the 1Mb Input Window (Centered on TSS)
+        half_window = args.window_size // 2
+        window_start = tss - half_window
+        window_end = tss + half_window
+        
+        # Define Gene Body (for Exclusion)
+        # We add a buffer to be safe
+        gene_buffer = 1000
+        gene_start_rel = (start_bp - window_start) - gene_buffer
+        gene_end_rel = (end_bp - window_start) + gene_buffer
+
+        return {
+            'chrom': chrom,
+            'start': window_start,
+            'end': window_end,
+            'strand': strand_sym,
+            'tss': tss,
+            'gene_start_rel': gene_start_rel,
+            'gene_end_rel': gene_end_rel
+        }
+
     else:
-        raise ValueError("No Target Specified. Use --gene TFEB or --region.")
+        raise ValueError("No Target Specified. Use --gene SYMBOL or --region.")
 
 def fetch_sequence(model, coords):
     keys = list(model._fasta_extractors.keys())
