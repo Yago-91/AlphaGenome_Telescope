@@ -1,62 +1,63 @@
 import numpy as np
 from utils import helpers
 
-def inspect_hits(top_hits, args, coords):
+def inspect_hits(top_hits, args, model, params, state, coords, wt_seq):
     """
-    Takes the top hits and queries specific tracks (TFs, Histones) 
-    to understand WHY they are enhancers.
+    Unbiased discovery using the pre-loaded model.
     """
-    # We need to reload the model? No, main.py should pass it? 
-    # For simplicity in this CLI architecture, we will re-initialize or 
-    # ideally we would pass the model object. 
-    # To keep files decoupled, let's assume we re-load OR (better) 
-    # we just run the inspection on the WILD TYPE sequence once 
-    # and map the bins to the hits.
+    print(f"--- Running Inspector on {len(top_hits)} regions ---")
     
-    # OPTIMIZATION: We don't need to run the model again!
-    # We just need the Wild-Type prediction (which we have from baseline)
-    # and look at the tracks at the specific bins corresponding to the hits.
+    # 1. Get Full Predictions (Using passed model/params)
+    print("Generating full-track regulatory map...")
+    # Pass params/state explicitly to avoid reloading logic in helper
+    full_preds = helpers.predict_all_tracks(model, params, state, wt_seq) 
     
-    print("Retrieving Mechanistic Data...")
+    # 2. Get Metadata
+    track_names = helpers.get_track_metadata(model)
     
-    # 1. Define tracks to inspect
-    # Primary tissue (Spleen) + Extra global markers (CTCF, Promoter)
-    tracks_to_check = args.inspect_tracks.split(',')
-    
-    # 2. Results container
     inspection_report = []
     
     for hit in top_hits:
-        # Calculate which bin in the 896-bin output corresponds to this hit
-        # The model outputs 896 bins for 1048576 bp.
-        # Ratio = 1048576 / 896 = 1170 bp per bin.
-        
         rel_pos = hit['start'] - coords['start']
-        bin_idx = int(rel_pos / 1170)
+        bin_idx = int(rel_pos / 128)
+        bin_idx = min(max(bin_idx, 0), full_preds.shape[0] - 1)
         
-        # Classification
-        hit_type = "Distal"
-        if abs(hit['distance_to_tss']) < 2000:
-            hit_type = "Promoter"
+        track_values = full_preds[bin_idx, :]
+        sorted_indices = np.argsort(track_values)[::-1]
+        
+        top_factors = []
+        seen_factors = set()
+        
+        # Forced Inclusions (if user asked for specific tracks)
+        forced_tracks = [t.strip().upper() for t in args.inspect_tracks.split(',')] if args.inspect_tracks else []
+        
+        # Scan ranked list
+        for idx in sorted_indices:
+            if len(top_factors) >= 10: break
             
-        report_row = {
+            raw_name = track_names[idx]
+            score = float(track_values[idx])
+            
+            # Check forced tracks
+            is_forced = any(f in raw_name.upper() for f in forced_tracks)
+            
+            # Heuristics for "Interesting" tracks
+            is_regulatory = any(x in raw_name.upper() for x in ['CHIP', 'TF', 'BINDING', 'DNASE', 'ATAC', 'H3K'])
+            is_expression = any(x in raw_name.upper() for x in ['RNA', 'CAGE'])
+            
+            if is_forced or (is_regulatory and not is_expression):
+                factor_name = helpers.clean_track_name(raw_name)
+                if factor_name not in seen_factors:
+                    top_factors.append(f"{factor_name} ({score:.2f})")
+                    seen_factors.add(factor_name)
+
+        hit_type = "Promoter" if abs(hit['distance_to_tss']) < 2000 else "Distal"
+            
+        inspection_report.append({
             'location': f"{hit['chrom']}:{hit['start']}-{hit['end']}",
-            'impact_score': hit['impact'],
-            'distance_to_tss': hit['distance_to_tss'],
+            'impact_on_gene': hit['impact'],
             'type': hit_type,
-            'tissue': args.tissue
-        }
-        
-        # Placeholder: In a persistent session we would query the existing `baseline_raw` 
-        # variable. Since we split files, we would ideally pass this data.
-        # For this standalone code, we assume 'Enrichment' is a placeholder 
-        # unless we re-run prediction. 
-        # *Self-Correction*: To make this real, `scanner.py` should return the baseline_raw 
-        # object or we perform inspection *inside* scanner.
-        
-        # For now, we will mark this for the user:
-        report_row['note'] = "Load this region in IGV to see TF tracks."
-        
-        inspection_report.append(report_row)
+            'top_regulatory_signals': "; ".join(top_factors)
+        })
         
     return inspection_report
