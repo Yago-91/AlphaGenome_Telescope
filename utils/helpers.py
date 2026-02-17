@@ -1,4 +1,6 @@
 import os
+import sys
+import requests
 import numpy as np
 import pandas as pd
 import jax
@@ -7,6 +9,7 @@ import jax.numpy as jnp
 # --- 1. COORDINATE & SEQUENCE HANDLING ---
 
 def resolve_coordinates(args):
+    # Hardcoded TFEB TSS for this version
     if args.gene and args.gene.upper() == "TFEB":
         tss = 41704353
         half_window = args.window_size // 2
@@ -38,9 +41,7 @@ def resolve_coordinates(args):
 def fetch_sequence(model, coords):
     keys = list(model._fasta_extractors.keys())
     hum_key = next((k for k in keys if "9606" in str(k) or "SAPIENS" in str(k).upper()), None)
-    
     if not hum_key:
-        print("WARNING: Could not identify Human Fasta Extractor. Using first available.")
         hum_key = keys[0]
 
     from alphagenome.data import genome
@@ -63,98 +64,102 @@ def mask_sequence(args):
     s_list[start_idx : end_idx] = ['N'] * (end_idx - start_idx)
     return "".join(s_list)
 
-# --- 2. MODEL INTERACTION & PREDICTION ---
+# --- 2. MODEL INTERACTION ---
 
 def find_track_indices(model, tissue, assay):
     all_tracks = get_track_metadata(model)
-    
     indices = []
     for i, name in enumerate(all_tracks):
         if tissue.lower() in name.lower() and assay.lower() in name.lower():
             indices.append(i)
-            
+    
     if not indices:
-        print(f"WARNING: No tracks found for '{tissue}' + '{assay}'. using first 5 tracks as fallback.")
+        print(f"WARNING: No tracks found for '{tissue}' + '{assay}'. (Searched {len(all_tracks)} tracks).")
+        print(f"Sample tracks: {all_tracks[:3]}")
+        # Return first 5 as emergency fallback to prevent crash, but user should know.
         return list(range(5))
-        
     return indices
 
 def get_head_key(preds, assay_name):
     keys = list(preds.keys())
-    target = next((k for k in keys if 'human' in str(k).lower()), None)
-    if not target:
-        target = keys[0]
+    # Prefer 'human' key
+    target = next((k for k in keys if 'human' in str(k).lower()), keys[0])
     return target
 
 def predict_baseline(model, params, state, seq, track_indices, agg_mode):
     enc = one_hot_encode(seq)[jnp.newaxis, ...]
-    
     with jax.disable_jit():
-        # FIX: Explicit keyword arguments
         preds = model._predict(
             params, state, enc, jnp.array([0]), 
             negative_strand_mask=jnp.array([False]), 
             strand_reindexing=None
         )
-    
     head_key = get_head_key(preds, 'human')
     data = np.array(preds[head_key])
     selected_data = data[0, :, track_indices]
     
-    if agg_mode == 'mean':
-        return float(np.nanmean(selected_data))
-    elif agg_mode == 'max':
-        return float(np.nanmax(selected_data))
+    if agg_mode == 'mean': return float(np.nanmean(selected_data))
+    elif agg_mode == 'max': return float(np.nanmax(selected_data))
     return float(np.nanmean(selected_data))
 
 def predict_all_tracks(model, params, state, seq):
     enc = one_hot_encode(seq)[jnp.newaxis, ...]
-    
     with jax.disable_jit():
-        # FIX: Explicit keyword arguments
         raw_out = model._predict(
             params, state, enc, jnp.array([0]), 
             negative_strand_mask=jnp.array([False]), 
             strand_reindexing=None
         )
-    
     head_key = get_head_key(raw_out, 'human')
     return np.array(raw_out[head_key][0])
 
-# --- 3. METADATA & INSPECTION UTILS ---
+# --- 3. METADATA HANDLING (The Fix) ---
+
+def download_official_tracks():
+    """Downloads the Enformer track list from a reliable source."""
+    url = "https://raw.githubusercontent.com/calico/basenji/master/manuscripts/cross2020/targets_human.txt"
+    dest = "human_track_names.txt"
+    
+    if not os.path.exists(dest):
+        print("   [i] Downloading official track metadata...")
+        try:
+            r = requests.get(url)
+            with open(dest, 'w') as f:
+                f.write(r.text)
+        except Exception as e:
+            print(f"   [!] Download failed: {e}")
+            return []
+            
+    # Read file (Format: index \t identifier \t description)
+    tracks = []
+    with open(dest, 'r') as f:
+        for line in f:
+            parts = line.strip().split('\t')
+            if len(parts) > 1:
+                # Combine identifier and description for better matching
+                # e.g., "CNhs12345 Spleen RNA-seq"
+                tracks.append(" ".join(parts))
+    return tracks
 
 def get_track_metadata(model):
-    # Debugging: Print available attributes to find where track names are
-    # keys = dir(model)
-    # print(f"DEBUG: Model attributes: {[k for k in keys if 'track' in k or 'name' in k]}")
-
-    if hasattr(model, 'track_names'):
-        return model.track_names
-    if hasattr(model, 'config') and hasattr(model.config, 'target_names'):
-        return model.config.target_names
-    if hasattr(model, '_track_names'):
-        return model._track_names
+    # 1. Try internal attributes
+    if hasattr(model, 'track_names'): return model.track_names
+    if hasattr(model, 'config') and hasattr(model.config, 'target_names'): return model.config.target_names
     
-    # Try looking in the generator config if it exists
-    if hasattr(model, 'generator') and hasattr(model.generator, 'track_names'):
-        return model.generator.track_names
+    # 2. Try fetching from file (The robust fix)
+    tracks = download_official_tracks()
+    if tracks:
+        return tracks
 
-    print("WARNING: Could not find track names in model metadata. Returning dummy IDs.")
+    print("WARNING: Could not find ANY track names. Using IDs.")
+    # Assuming Enformer standard 5313
     return [f"Track_{i}" for i in range(5313)]
 
 def clean_track_name(raw_name):
     parts = raw_name.replace(':', ' ').replace('_', ' ').split()
-    vocab = ['CTCF', 'PU.1', 'SPI1', 'H3K27AC', 'H3K4ME3', 'H3K4ME1', 'H3K27ME3', 'POL2', 'DNASE', 'ATAC']
-    
+    vocab = ['CTCF', 'PU.1', 'SPI1', 'H3K27AC', 'H3K4ME3', 'POL2', 'DNASE', 'ATAC']
     for word in parts:
-        if word.upper() in vocab:
-            return word.upper()
-    
-    if ':' in raw_name:
-        try:
-            return raw_name.split(':')[1]
-        except:
-            pass
+        if word.upper() in vocab: return word.upper()
     return raw_name
 
 # --- 4. FILE WRITERS ---
@@ -169,20 +174,14 @@ def save_scan_results(results, args, coords):
     bg_name = csv_name.replace('.csv', '.bedgraph')
     bg_path = os.path.join(args.out_dir, bg_name)
     with open(bg_path, 'w') as f:
-        f.write(f"track type=bedGraph name='{args.gene} {args.tissue} Impact' description='Impact Score (Baseline - Mutant)' visibility=full autoScale=on color=255,0,0\n")
+        f.write(f"track type=bedGraph name='{args.gene} Impact' color=255,0,0\n")
         for r in results:
             f.write(f"{r['chrom']}\t{r['start']}\t{r['end']}\t{r['impact']:.5f}\n")
     print(f"   [+] BedGraph Saved: {bg_path}")
 
 def save_inspection_report(data, args):
-    if not data:
-        print("   [!] No inspection data generated.")
-        return
+    if not data: return
     df = pd.DataFrame(data)
-    csv_name = f"{args.gene if args.gene else 'Region'}_inspection_report.csv"
-    csv_path = os.path.join(args.out_dir, csv_name)
-    cols = ['location', 'type', 'impact_on_gene', 'top_regulatory_signals']
-    existing_cols = [c for c in cols if c in df.columns] + [c for c in df.columns if c not in cols]
-    df = df[existing_cols]
+    csv_path = os.path.join(args.out_dir, f"{args.gene if args.gene else 'Region'}_inspection_report.csv")
     df.to_csv(csv_path, index=False)
     print(f"   [+] Inspection Report Saved: {csv_path}")
