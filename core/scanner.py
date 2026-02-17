@@ -7,19 +7,13 @@ import jax
 import jax.numpy as jnp
 
 def run_scan(args, coords, model, params, state, wt_seq):
-    """
-    Scans the sequence for regulatory elements impacting the target.
-    """
-    # 1. Define Target Tracks
     target_indices = helpers.find_track_indices(model, args.tissue, args.assay)
     print(f"Tracking {len(target_indices)} output heads for '{args.tissue} {args.assay}'")
     
-    # 2. Baseline
     print("Calculating Baseline...")
     baseline_val = helpers.predict_baseline(model, params, state, wt_seq, target_indices, args.agg_mode)
     print(f"Global Baseline: {baseline_val:.4f}")
 
-    # 3. Generate Variants
     indices = list(range(0, len(wt_seq) - args.mutation_size, args.step_size))
     
     if args.exclude_gene_body and 'gene_start_rel' in coords:
@@ -34,17 +28,19 @@ def run_scan(args, coords, model, params, state, wt_seq):
         tasks = [(wt_seq, i, args.mutation_size) for i in indices]
         masked_seqs = list(tqdm(exc.map(helpers.mask_sequence, tasks), total=len(indices)))
 
-    # 4. JIT Compilation
     print("Compiling JIT Kernel...")
     @jax.jit
     def fast_predict(inputs, org_idx, neg_mask):
-        return model._predict(params, state, inputs, org_idx, negative_strand_mask=neg_mask, strand_reindexing=None)
+        # FIX: Explicit keyword arguments
+        return model._predict(
+            params, state, inputs, org_idx, 
+            negative_strand_mask=neg_mask, 
+            strand_reindexing=None
+        )
     
-    # Warmup
     warmup = jnp.zeros((args.batch_size, len(wt_seq), 4), dtype=jnp.float32)
     _ = fast_predict(warmup, jnp.zeros((args.batch_size,), dtype=jnp.int32), jnp.zeros((args.batch_size,), dtype=bool))
 
-    # 5. The Loop
     results = []
     
     for i in tqdm(range(0, len(masked_seqs), args.batch_size)):
@@ -64,7 +60,6 @@ def run_scan(args, coords, model, params, state, wt_seq):
             jnp.zeros((args.batch_size,), dtype=bool)
         )
         
-        # Extract Logic
         head_key = helpers.get_head_key(preds, args.assay)
         raw_data = np.array(preds[head_key])
         
