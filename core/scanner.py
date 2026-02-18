@@ -1,14 +1,13 @@
 import gc
 import numpy as np
 from tqdm import tqdm
-from concurrent.futures import ProcessPoolExecutor
+# Removed ProcessPoolExecutor to prevent JAX deadlocks
 from utils import helpers
 import jax
 import jax.numpy as jnp
 
 def run_scan(args, coords, model, params, state, wt_seq):
     # 1. SETUP TRACKS
-    # This now returns "ALL" (string) if specific metadata is missing
     target_indices = helpers.find_track_indices(model, args.tissue, args.assay)
     
     # 2. PREPARE VARIANTS
@@ -18,9 +17,7 @@ def run_scan(args, coords, model, params, state, wt_seq):
     if args.exclude_gene_body and 'gene_start_rel' in coords:
         g_start = coords['gene_start_rel']
         g_end = coords['gene_end_rel']
-        original_len = len(indices)
         indices = [i for i in indices if not (i < g_end and (i + args.mutation_size) > g_start)]
-        print(f"Excluded gene body. Scannable variants: {len(indices)} (was {original_len})")
 
     # 3. COMPILE JIT KERNEL
     print("Compiling JIT Kernel...")
@@ -39,42 +36,47 @@ def run_scan(args, coords, model, params, state, wt_seq):
     else:
         batch_input = wt_encoded
 
-    # Run Inference
-    # NOTE: We use jnp.ones for Organism Index (1 = Human)
+    # Run Inference (Human = 1)
     base_preds = fast_predict(
         params, state, batch_input, 
         jnp.ones((args.batch_size,), dtype=jnp.int32), 
         jnp.zeros((args.batch_size,), dtype=bool)
     )
     
-    # Get Correct Head (e.g., 'OutputType.RNA_SEQ')
+    # Head Selection
     head_key = helpers.get_head_key(base_preds, args.assay)
     print(f"   [i] Selected Head: '{head_key}'")
     
     base_data = np.array(base_preds[head_key]) # Move to CPU
     
-    # --- LOGIC UPDATE: Handle "ALL" Tracks ---
+    # Handle "ALL" tracks
     if target_indices == "ALL":
         print(f"   [i] Blind Mode: Tracking ALL {base_data.shape[-1]} tracks in this head.")
-        base_relevant = base_data[0, :, :] # Select everything
+        base_relevant = base_data[0, :, :]
     else:
         base_relevant = base_data[0, :, target_indices]
     
-    # Calculate Scalar Baseline
+    # Calculate Baseline
     if args.agg_mode == 'mean': baseline_val = float(np.nanmean(base_relevant))
     else: baseline_val = float(np.nanmax(base_relevant))
         
     print(f"   [i] Global Baseline: {baseline_val:.4f}")
     
-    # Cleanup VRAM
+    # Sanity Check
+    if np.isnan(baseline_val):
+        print("   [!] CRITICAL WARNING: Baseline is NaN. Checking input sequence...")
+        if "N" in wt_seq: print("       -> Sequence contains 'N's (unknown bases).")
+        else: print("       -> Sequence looks valid (ACTG only). Issue is likely model/float16 related.")
+    
     del base_preds, batch_input
     gc.collect()
 
-    # 5. GENERATE MUTANT SEQUENCES
-    print("Generating Masked Sequences...")
-    with ProcessPoolExecutor() as exc:
-        tasks = [(wt_seq, i, args.mutation_size) for i in indices]
-        masked_seqs = list(tqdm(exc.map(helpers.mask_sequence, tasks), total=len(indices)))
+    # 5. GENERATE MUTANT SEQUENCES (Single Threaded Fix)
+    print("Generating Masked Sequences (Single-Threaded)...")
+    masked_seqs = []
+    # Simple list comprehension is fast enough for string manipulation
+    for i in tqdm(indices):
+        masked_seqs.append(helpers.mask_sequence((wt_seq, i, args.mutation_size)))
 
     print("Scan Started...")
     results = []
@@ -93,7 +95,6 @@ def run_scan(args, coords, model, params, state, wt_seq):
             
         batch_arr = jnp.stack([helpers.one_hot_encode(s) for s in batch_seqs])
         
-        # Run Inference
         preds = fast_predict(
             params, state, batch_arr, 
             jnp.ones((args.batch_size,), dtype=jnp.int32), 
@@ -104,7 +105,6 @@ def run_scan(args, coords, model, params, state, wt_seq):
         del preds
         
         for j in range(curr_bs):
-            # Select relevant tracks (ALL or Specific)
             if target_indices == "ALL":
                 curr_tracks = raw_data[j, :, :]
             else:
