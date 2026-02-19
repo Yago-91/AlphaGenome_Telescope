@@ -21,7 +21,9 @@ def run_scan(args, coords, model, params, state, wt_seq):
     print("Compiling JIT Kernel...")
     @jax.jit
     def fast_predict(p, s, inputs, o, n):
-        return model._predict(p, s, inputs, o, negative_strand_mask=n, strand_reindexing=None)
+        # Force inputs into BFloat16 before they hit the model layers
+        inputs_bf16 = jnp.array(inputs, dtype=jnp.bfloat16)
+        return model._predict(p, s, inputs_bf16, o, negative_strand_mask=n, strand_reindexing=None)
 
     # 4. CALCULATE BASELINE (JIT Optimized)
     print("Calculating Baseline (JIT Optimized)...")
