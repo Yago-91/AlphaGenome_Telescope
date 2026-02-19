@@ -1,5 +1,4 @@
 import os
-import sys
 import requests
 import json
 import numpy as np
@@ -8,7 +7,7 @@ import jax
 import jax.numpy as jnp
 import mygene
 
-# --- 1. COORDINATE & SEQUENCE HANDLING (Same as before) ---
+# --- 1. COORDINATE & SEQUENCE HANDLING ---
 def resolve_coordinates(args):
     if args.region:
         try:
@@ -25,7 +24,8 @@ def resolve_coordinates(args):
         hit = results['hits'][0]
         gpos = hit.get('genomic_pos', {})
         if isinstance(gpos, list): gpos = gpos[0]
-        
+        if not gpos: raise ValueError(f"No coordinates for {args.gene}")
+
         chrom = f"chr{gpos['chr']}"
         tss = gpos['start'] if gpos['strand'] == 1 else gpos['end']
         strand = '+' if gpos['strand'] == 1 else '-'
@@ -60,66 +60,42 @@ def mask_sequence(args):
     s_list[start_idx : end] = ['N'] * (end - start_idx)
     return "".join(s_list)
 
-# --- 2. METADATA HANDLING (THE NEW FIX) ---
-
-def download_alphagenome_metadata():
-    """
-    Downloads the specific track metadata for AlphaGenome.
-    Since there isn't one single 'master' text file easily accessible via raw URL 
-    like Enformer, we will infer it or use a known comprehensive mapping if available.
-    
-    For now, we will construct a robust fallback that works for the 
-    standard AlphaGenome open-source release.
-    """
-    # 1. Try to find the file locally if you put it there manually
-    local_path = "alphagenome_metadata.json"
-    if os.path.exists(local_path):
-        with open(local_path, 'r') as f:
-            return json.load(f)
-
-    print("   [i] No local metadata found. Using Blind Mode (Averaging all tracks in head).")
-    return None
-
-def find_track_indices(model, tissue, assay):
-    """
-    Returns the specific indices for the requested tissue/assay.
-    If metadata is missing, returns "ALL".
-    """
-    metadata = download_alphagenome_metadata()
-    
-    # If we don't have the file, we can't filter.
-    if metadata is None:
-        return "ALL"
-    
-    # Logic to filter metadata if we had it
-    # ... (Implementation depends on the JSON structure)
-    
-    return "ALL"
-
+# --- 2. MULTI-HEAD SELECTION ---
 def get_head_key(preds, assay_name):
-    # Same "Explicit Mapping" logic as before
     keys = list(preds.keys())
     assay = assay_name.upper()
+    
     mapping = {
-        'RNA': ['RNA', 'SEQ'], 'CAGE': ['CAGE'], 'ATAC': ['ATAC'],
-        'DNASE': ['DNASE'], 'CHIP': ['CHIP', 'TF'], 'HISTONE': ['HISTONE']
+        'RNA': ['RNA', 'SEQ'],
+        'CAGE': ['CAGE'],
+        'ATAC': ['ATAC'],
+        'DNASE': ['DNASE'],
+        'CHIP': ['CHIP', 'TF'],
+        'HISTONE': ['HISTONE']
     }
+    
     keywords = mapping.get(assay, [assay])
     
     for k in keys:
-        if all(kw in str(k).upper() for kw in keywords):
+        k_str = str(k).upper()
+        if all(kw in k_str for kw in keywords):
             return k
-    
-    # Fallback to largest
+            
     best_k = keys[0]
     max_dim = 0
     for k, v in preds.items():
         if hasattr(v, 'shape') and v.shape[-1] > max_dim:
             max_dim = v.shape[-1]
             best_k = k
+            
+    print(f"   [!] WARNING: Could not find exact head for '{assay}'. Fallback to largest: '{best_k}'")
     return best_k
 
-# --- 3. WRITERS (Same as before) ---
+def find_track_indices(model, tissue, assay):
+    # AlphaGenome open source metadata not available, defaulting to Blind Mode.
+    return "ALL" 
+
+# --- 3. WRITERS ---
 def save_scan_results(results, args, coords):
     df = pd.DataFrame(results)
     csv_name = f"{args.gene if args.gene else 'Region'}_{args.tissue}_{args.assay}_scan.csv"
@@ -142,7 +118,7 @@ def save_inspection_report(data, args):
     df.to_csv(csv_path, index=False)
     print(f"   [+] Inspection Report Saved: {csv_path}")
 
-# Unused stubs
+# Unused legacy stubs
 def predict_baseline(model, params, state, seq, track_indices, agg_mode): pass
 def predict_all_tracks(model, params, state, seq): pass
 def get_track_metadata(model): return []
