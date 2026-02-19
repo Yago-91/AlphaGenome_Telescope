@@ -6,26 +6,29 @@ import jax
 import jax.numpy as jnp
 
 def run_scan(args, coords, model, params, state, wt_seq):
-    # 1. SETUP TRACKS
     target_indices = helpers.find_track_indices(model, args.tissue, args.assay)
     
-    # 2. PREPARE VARIANTS
     indices = list(range(0, len(wt_seq) - args.mutation_size, args.step_size))
-    
     if args.exclude_gene_body and 'gene_start_rel' in coords:
         g_start = coords['gene_start_rel']
         g_end = coords['gene_end_rel']
         indices = [i for i in indices if not (i < g_end and (i + args.mutation_size) > g_start)]
 
-    # 3. COMPILE JIT KERNEL
     print("Compiling JIT Kernel...")
     @jax.jit
     def fast_predict(p, s, inputs, o, n):
-        # Force inputs into BFloat16 before they hit the model layers
+        # 1. Input Translation: Match the BFloat16 weights
         inputs_bf16 = jnp.array(inputs, dtype=jnp.bfloat16)
-        return model._predict(p, s, inputs_bf16, o, negative_strand_mask=n, strand_reindexing=None)
+        
+        # 2. Heavy Math: Runs safely in VRAM without overflow
+        preds = model._predict(p, s, inputs_bf16, o, negative_strand_mask=n, strand_reindexing=None)
+        
+        # 3. Output Translation: Cast back to Float32 so standard NumPy can read it!
+        return jax.tree_util.tree_map(
+            lambda x: x.astype(jnp.float32) if getattr(x, 'dtype', None) == jnp.bfloat16 else x, 
+            preds
+        )
 
-    # 4. CALCULATE BASELINE (JIT Optimized)
     print("Calculating Baseline (JIT Optimized)...")
     
     wt_encoded = helpers.one_hot_encode(wt_seq)[jnp.newaxis, ...]
@@ -35,7 +38,6 @@ def run_scan(args, coords, model, params, state, wt_seq):
     else:
         batch_input = wt_encoded
 
-    # Run Inference (Index 0 = Human)
     base_preds = fast_predict(
         params, state, batch_input, 
         jnp.zeros((args.batch_size,), dtype=jnp.int32), 
@@ -45,7 +47,7 @@ def run_scan(args, coords, model, params, state, wt_seq):
     head_key = helpers.get_head_key(base_preds, args.assay)
     print(f"   [i] Selected Head: '{head_key}'")
     
-    base_data = np.array(base_preds[head_key]) # Move to CPU
+    base_data = np.array(base_preds[head_key])
     
     if target_indices == "ALL":
         print(f"   [i] Blind Mode: Tracking ALL {base_data.shape[-1]} tracks in this head.")
@@ -59,12 +61,11 @@ def run_scan(args, coords, model, params, state, wt_seq):
     print(f"   [i] Global Baseline: {baseline_val:.4f}")
     
     if np.isnan(baseline_val):
-        print("   [!] CRITICAL WARNING: Baseline is NaN. Precision fixes may have failed.")
+        print("   [!] CRITICAL WARNING: Baseline is still NaN. Hardware incompatibility remains.")
     
     del base_preds, batch_input
     gc.collect()
 
-    # 5. GENERATE MUTANT SEQUENCES (Safe Single-Threaded)
     print("Generating Masked Sequences (Single-Threaded)...")
     masked_seqs = []
     for i in tqdm(indices):
@@ -74,7 +75,6 @@ def run_scan(args, coords, model, params, state, wt_seq):
     results = []
     tss_offset = coords.get('tss', 0)
     
-    # 6. SCANNING LOOP
     for i in tqdm(range(0, len(masked_seqs), args.batch_size)):
         if i % 10 == 0: gc.collect()
         
@@ -86,7 +86,6 @@ def run_scan(args, coords, model, params, state, wt_seq):
             
         batch_arr = jnp.stack([helpers.one_hot_encode(s) for s in batch_seqs])
         
-        # Run Inference (Index 0 = Human)
         preds = fast_predict(
             params, state, batch_arr, 
             jnp.zeros((args.batch_size,), dtype=jnp.int32), 
