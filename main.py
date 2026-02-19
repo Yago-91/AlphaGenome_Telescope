@@ -13,7 +13,6 @@ os.environ["NVIDIA_TF32_OVERRIDE"] = "0"
 os.environ["JAX_DEFAULT_MATMUL_PRECISION"] = "float32"
 
 import argparse
-import haiku as hk
 import jax.numpy as jnp
 from utils import helpers
 from core import scanner, inspector
@@ -65,17 +64,10 @@ def main():
     print(f"Analysis Window: {coords['chrom']}:{coords['start']}-{coords['end']} ({coords['strand']})")
 
     # --- THE BFLOAT16 FIX ---
-    print("Loading AlphaGenome Model into VRAM (BFloat16 Precision)...")
-    
-    # BFloat16 prevents Infinity/NaN overflows while saving massive VRAM
-    policy = hk.mixed_precision.MixedPrecisionPolicy(
-        param_dtype=jnp.bfloat16, 
-        compute_dtype=jnp.bfloat16, 
-        output_dtype=jnp.float32
-    )
-    
-    with hk.mixed_precision.policy_scope(policy):
-        model = dna_model.create_from_huggingface('all_folds')
+    print("Loading AlphaGenome Model into VRAM (Strict FP32 Environment)...")
+    # We rely on the JAX environment variables set at the top of the file 
+    # to maintain strict numerical stability on the RTX 5090.
+    model = dna_model.create_from_huggingface('all_folds')
     
     params = getattr(model, '_params', None) or getattr(model, 'params', None)
     state = getattr(model, '_state', None) or getattr(model, 'state', None)
